@@ -36,8 +36,12 @@ function delay(ms) {
 }
 
 /**
- * Fetches and caches raw HTML payload for a given URL.
- * Systems Analogy: Edge Proxy Caching with TTL verification.
+ * Fetches and caches raw HTML payload for a given URL with failure tolerance.
+ * Systems Analogy: Edge Proxy Caching with TTL verification and fault isolation.
+ * Rules:
+ *  - Retries once on timeout or 5xx server error.
+ *  - NEVER retries 404 (Not Found) or 403 (Forbidden).
+ *  - Returns success/failure status object instead of exiting process.
  */
 async function fetchAndCachePage(url, cacheFilename, stats) {
   const cachePath = path.join(__dirname, '..', 'cache', cacheFilename);
@@ -50,39 +54,68 @@ async function fetchAndCachePage(url, cacheFilename, stats) {
     const fetchedAt = fs.statSync(cachePath).mtime.toISOString();
     stats.cacheHits++;
     console.log(`[CACHE HIT] Loaded: ${cacheFilename} (${duration} ms)`);
-    return { htmlContent: cachedData, wasCached: true, duration, fetchedAt };
+    return { success: true, htmlContent: cachedData, wasCached: true, duration, fetchedAt };
   }
 
-  // 2. Local Cache Miss -> Initiate Network Call (FETCH)
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  // 2. Local Cache Miss -> Initiate Network Call with max 1 retry on timeout/5xx
+  const maxAttempts = 2;
 
-  try {
-    stats.networkRequests++;
-    console.log(`[FETCH] Requesting URL: ${url}`);
-    const response = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT },
-      signal: controller.signal
-    });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    clearTimeout(timeoutId);
+    try {
+      if (attempt === 1) stats.networkRequests++;
+      console.log(`[FETCH] Requesting URL (Attempt ${attempt}/${maxAttempts}): ${url}`);
 
-    if (response.status !== 200) {
-      throw new Error(`HTTP Request Failed with Status Code: ${response.status}`);
+      const response = await fetch(url, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      // Do NOT retry on 404 (Not Found) or 403 (Forbidden)
+      if (response.status === 404 || response.status === 403) {
+        console.warn(`[WARN] HTTP ${response.status} received for ${url}. Not retrying.`);
+        return { success: false, status: response.status, error: `HTTP ${response.status}` };
+      }
+
+      // Retry once on 5xx Server Errors
+      if (response.status >= 500 && attempt < maxAttempts) {
+        console.warn(`[RETRY] Server error HTTP ${response.status} on attempt ${attempt}. Waiting 1s before retry...`);
+        await delay(1000);
+        continue;
+      }
+
+      if (response.status !== 200) {
+        return { success: false, status: response.status, error: `HTTP ${response.status}` };
+      }
+
+      const htmlContent = await response.text();
+      const fetchedAt = new Date().toISOString();
+      fs.writeFileSync(cachePath, htmlContent, 'utf-8');
+
+      const duration = (performance.now() - startTime).toFixed(2);
+      console.log(`[FETCH SUCCESS] Saved to cache: ${cacheFilename} (${duration} ms)`);
+      return { success: true, htmlContent, wasCached: false, duration, fetchedAt };
+
+    } catch (error) {
+      clearTimeout(timeoutId);
+      const isTimeout = error.name === 'AbortError';
+      const errorMsg = isTimeout ? 'Network Timeout' : error.message;
+
+      if (attempt < maxAttempts) {
+        console.warn(`[RETRY] Fetch failed (${errorMsg}). Retrying attempt ${attempt + 1}/${maxAttempts}...`);
+        await delay(1000);
+      } else {
+        console.error(`[ERROR] Fetch permanently failed for ${url}: ${errorMsg}`);
+        return { success: false, status: null, error: errorMsg };
+      }
     }
-
-    const htmlContent = await response.text();
-    const fetchedAt = new Date().toISOString();
-    fs.writeFileSync(cachePath, htmlContent, 'utf-8');
-
-    const duration = (performance.now() - startTime).toFixed(2);
-    console.log(`[FETCH SUCCESS] Saved to cache: ${cacheFilename} (${duration} ms)`);
-    return { htmlContent, wasCached: false, duration, fetchedAt };
-  } catch (error) {
-    clearTimeout(timeoutId);
-    console.error(`[ERROR] Fetch failed for ${url}: ${error.message}`);
-    process.exit(1);
   }
+
+  return { success: false, error: 'Unknown fetch failure' };
 }
 
 /**
@@ -143,7 +176,6 @@ function parseBookDetail(html, productUrl, sourcePage, fetchedAt) {
     fetched_at: fetchedAt
   };
 }
-
 
 /**
  * Stage 4 Helper: Extracts float price from raw text.
@@ -215,28 +247,36 @@ function validateAndNormalizeRecord(raw) {
 }
 
 /**
- * Main Crawl & Extraction Pipeline (Stages 1-4).
+ * Main Crawl, Extraction & Persistence Pipeline (Stages 1-5).
  */
 async function processPipeline() {
+  const startTimeIso = new Date().toISOString();
+  const startTimeMs = performance.now();
   let currentCatalogueUrl = START_URL;
   let cataloguePagesProcessed = 0;
   const discoveredBookItems = [];
-  const stats = { cacheHits: 0, networkRequests: 0 };
+  const stats = { cacheHits: 0, networkRequests: 0, failedPages: 0 };
 
   console.log('[+] Phase 1 & 2: Discovering Catalogue Links...');
 
   // 1. Crawl Catalogue Pages (Stages 1 & 2)
   while (currentCatalogueUrl && cataloguePagesProcessed < MAX_CATALOGUE_PAGES) {
     const pageName = currentCatalogueUrl.split('/').pop();
-    const { htmlContent, wasCached } = await fetchAndCachePage(currentCatalogueUrl, pageName, stats);
+    const fetchResult = await fetchAndCachePage(currentCatalogueUrl, pageName, stats);
     
-    const { bookItems, nextUrl } = extractCatalogueLinks(htmlContent, currentCatalogueUrl);
+    if (!fetchResult.success) {
+      console.error(`[CRITICAL] Failed to fetch catalogue page ${currentCatalogueUrl}`);
+      stats.failedPages++;
+      break;
+    }
+
+    const { bookItems, nextUrl } = extractCatalogueLinks(fetchResult.htmlContent, currentCatalogueUrl);
     discoveredBookItems.push(...bookItems);
 
     cataloguePagesProcessed++;
     currentCatalogueUrl = nextUrl;
 
-    if (!wasCached && currentCatalogueUrl && cataloguePagesProcessed < MAX_CATALOGUE_PAGES) {
+    if (!fetchResult.wasCached && currentCatalogueUrl && cataloguePagesProcessed < MAX_CATALOGUE_PAGES) {
       console.log(`[THROTTLING] Pausing for ${RATE_LIMIT_DELAY_MS}ms before next request...`);
       await delay(RATE_LIMIT_DELAY_MS);
     }
@@ -249,14 +289,21 @@ async function processPipeline() {
       uniqueBookItemsMap.set(item.url, item);
     }
   }
+
+  // Stage 5 Requirement 4: Injected intentional made-up book URL to test fault isolation
+  uniqueBookItemsMap.set('https://books.toscrape.com/catalogue/fake-non-existent-book_9999/index.html', {
+    url: 'https://books.toscrape.com/catalogue/fake-non-existent-book_9999/index.html',
+    sourcePage: START_URL
+  });
+
   const uniqueBookItems = Array.from(uniqueBookItemsMap.values());
 
-  console.log(`\n[+] Catalogue scan completed: Found ${uniqueBookItems.length} unique book detail URLs.\n`);
-  console.log('=== Stage 3: Extract Raw Records ===\n');
+  console.log(`\n[+] Catalogue scan completed: ${uniqueBookItems.length} book URLs queued (includes 1 intentional fake URL).\n`);
+  console.log('=== Stage 3 & 5: Extract Detail Records & Handle Fault Tolerances ===\n');
 
   const rawRecords = [];
 
-  // 2. Fetch and Extract each detail page (Stage 3)
+  // 2. Fetch and Extract each detail page (Stage 3 + Stage 5 error handling)
   for (let i = 0; i < uniqueBookItems.length; i++) {
     const { url, sourcePage } = uniqueBookItems[i];
     
@@ -264,23 +311,30 @@ async function processPipeline() {
     const slug = urlParts.slice(-2, -1)[0] || `item_${i + 1}`;
     const cacheFilename = `detail_${slug}.html`;
 
-    const { htmlContent, wasCached, fetchedAt } = await fetchAndCachePage(url, cacheFilename, stats);
-    const record = parseBookDetail(htmlContent, url, sourcePage, fetchedAt);
+    const fetchResult = await fetchAndCachePage(url, cacheFilename, stats);
     
+    // Stage 5 Isolation: Log and skip bad pages without stopping the pipeline
+    if (!fetchResult.success) {
+      console.warn(`[SKIPPED] Bad page isolated: ${url} (Reason: ${fetchResult.error})`);
+      stats.failedPages++;
+      continue;
+    }
+
+    const record = parseBookDetail(fetchResult.htmlContent, url, sourcePage, fetchResult.fetchedAt);
     rawRecords.push(record);
 
-    if (!wasCached && i < uniqueBookItems.length - 1) {
+    if (!fetchResult.wasCached && i < uniqueBookItems.length - 1) {
       console.log(`[THROTTLING] Pausing for ${RATE_LIMIT_DELAY_MS}ms before next request...`);
       await delay(RATE_LIMIT_DELAY_MS);
     }
   }
 
-
+  // Persist Raw Records (Stage 3 Output)
   const baseDir = path.resolve(__dirname, '..');
   const rawPath = path.join(baseDir, 'output', 'raw_records.json');
   fs.writeFileSync(rawPath, JSON.stringify(rawRecords, null, 2), 'utf-8');
 
-  console.log('=== Stage 4: Clean, Validate, and Store ===\n');
+  console.log('\n=== Stage 4: Clean, Validate, and Store ===\n');
 
   // Idempotent deduplication map keyed by canonical product_url
   const booksMap = new Map();
@@ -310,29 +364,43 @@ async function processPipeline() {
   const errorsPath = path.join(baseDir, 'output', 'errors.json');
   fs.writeFileSync(errorsPath, JSON.stringify(errorRecords, null, 2), 'utf-8');
 
-  // Stage 4 Checkpoint Assertions
-  const allPricesAreNumbers = validBooks.every(b => typeof b.price_gbp === 'number' && !isNaN(b.price_gbp));
-  const allUrlsAreHttps = validBooks.every(b => b.product_url.startsWith('https://'));
+  // Stage 5 Requirement 3: Write output/run-report.json with honest numbers
+  const durationSeconds = parseFloat(((performance.now() - startTimeMs) / 1000).toFixed(2));
+  
+  const runReport = {
+    start_time: startTimeIso,
+    duration_seconds: durationSeconds,
+    pages_fetched: stats.networkRequests,
+    cache_hits: stats.cacheHits,
+    valid_records: validBooks.length,
+    invalid_records: errorRecords.length,
+    failed_pages: stats.failedPages
+  };
 
-  console.log('=== Stage 4 Checkpoint ===');
+  const reportPath = path.join(baseDir, 'output', 'run-report.json');
+  fs.writeFileSync(reportPath, JSON.stringify(runReport, null, 2), 'utf-8');
+
+  console.log('=== Stage 5 Checkpoint ===');
   console.log(`books.json count: ${validBooks.length}`);
-  console.log(`errors.json count: ${errorRecords.length}`);
-  console.log(`Assertion - Every price_gbp is a number: ${allPricesAreNumbers}`);
-  console.log(`Assertion - Every product_url starts with https://: ${allUrlsAreHttps}`);
+  console.log(`run-report.json failed_pages: ${runReport.failed_pages}`);
+  console.log(`run-report.json valid_records: ${runReport.valid_records}`);
+  console.log('\n[+] Stage 5 complete. Audit report written to output/run-report.json');
 
-  console.log('\n[+] Stage 4 complete. Clean records saved to output/books.json');
-  return { validBooks, errorRecords };
+  return runReport;
 }
 
+/**
+ * Main Entry Point.
+ */
 async function main() {
-  console.log('=== Ethical Web Scraper Pipeline: Stages 1-4 ===\n');
+  console.log('=== Ethical Web Scraper Pipeline: Stages 1-5 ===\n');
   const overallStart = performance.now();
   
   initializeEnvironment();
   await processPipeline();
 
   const totalSeconds = ((performance.now() - overallStart) / 1000).toFixed(2);
-  console.log(`\n[+] Stage 4 execution finished in ${totalSeconds}s.`);
+  console.log(`\n[+] Pipeline execution completed in ${totalSeconds}s.`);
 }
 
 // Trigger Execution
