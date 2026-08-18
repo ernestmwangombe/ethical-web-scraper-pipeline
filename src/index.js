@@ -144,8 +144,78 @@ function parseBookDetail(html, productUrl, sourcePage, fetchedAt) {
   };
 }
 
+
 /**
- * Main Crawl & Raw Extraction Orchestrator (Stages 1-3).
+ * Stage 4 Helper: Extracts float price from raw text.
+ * Example: "£51.77" -> 51.77
+ */
+function extractPriceGBP(priceText) {
+  if (!priceText) return null;
+  const match = priceText.match(/[\d.]+/);
+  return match ? parseFloat(match[0]) : null;
+}
+
+/**
+ * Stage 4 Helper: Validates raw record against Schema rules.
+ * Keeps clean normalized fields (price_gbp) side-by-side with raw fields.
+ */
+function validateAndNormalizeRecord(raw) {
+  const errors = [];
+
+  // 1. Required string field checks
+  if (!raw.title || typeof raw.title !== 'string') {
+    errors.push('Missing or invalid title');
+  }
+
+  // 2. Canonical URL validation
+  if (!raw.product_url || !raw.product_url.startsWith('https://')) {
+    errors.push('product_url must be an absolute HTTPS URL');
+  }
+
+  // 3. Price conversion & validation
+  const priceGbp = extractPriceGBP(raw.price_text);
+  if (priceGbp === null || isNaN(priceGbp)) {
+    errors.push(`Invalid price_text: "${raw.price_text}" could not be parsed to number`);
+  }
+
+  // 4. Provenance & metadata validation
+  if (!raw.source_page || !raw.source_page.startsWith('https://')) {
+    errors.push('source_page must be a valid HTTPS URL');
+  }
+
+  if (!raw.fetched_at || isNaN(Date.parse(raw.fetched_at))) {
+    errors.push('fetched_at must be a valid ISO timestamp');
+  }
+
+  if (errors.length > 0) {
+    return {
+      success: false,
+      errors,
+      rawRecord: raw
+    };
+  }
+
+  // Side-by-side normalized record construction
+  const normalizedRecord = {
+    title: raw.title,
+    product_url: raw.product_url,
+    price_text: raw.price_text,
+    price_gbp: priceGbp,
+    availability_text: raw.availability_text,
+    rating_text: raw.rating_text,
+    description: raw.description,
+    source_page: raw.source_page,
+    fetched_at: raw.fetched_at
+  };
+
+  return {
+    success: true,
+    record: normalizedRecord
+  };
+}
+
+/**
+ * Main Crawl & Extraction Pipeline (Stages 1-4).
  */
 async function processPipeline() {
   let currentCatalogueUrl = START_URL;
@@ -205,29 +275,64 @@ async function processPipeline() {
     }
   }
 
-  // Persist Raw Records output only
+
   const baseDir = path.resolve(__dirname, '..');
   const rawPath = path.join(baseDir, 'output', 'raw_records.json');
   fs.writeFileSync(rawPath, JSON.stringify(rawRecords, null, 2), 'utf-8');
 
-  console.log('\n=== Stage 3 Checkpoint ===');
-  console.log(`detail_pages=${rawRecords.length}\n`);
-  console.log('Sample Raw Record (1 of 60):');
-  console.log(JSON.stringify(rawRecords[0], null, 2));
+  console.log('=== Stage 4: Clean, Validate, and Store ===\n');
 
-  console.log('\n[+] Raw record extraction complete. Saved to output/raw_records.json');
-  return rawRecords;
+  // Idempotent deduplication map keyed by canonical product_url
+  const booksMap = new Map();
+  const errorRecords = [];
+
+  for (const rawRecord of rawRecords) {
+    const validationResult = validateAndNormalizeRecord(rawRecord);
+
+    if (validationResult.success) {
+      // Idempotency: product_url acts as canonical identity
+      booksMap.set(validationResult.record.product_url, validationResult.record);
+    } else {
+      errorRecords.push({
+        reasons: validationResult.errors,
+        raw_record: validationResult.rawRecord
+      });
+    }
+  }
+
+  const validBooks = Array.from(booksMap.values());
+
+  // Save clean validated records to output/books.json
+  const booksPath = path.join(baseDir, 'output', 'books.json');
+  fs.writeFileSync(booksPath, JSON.stringify(validBooks, null, 2), 'utf-8');
+
+  // Save errors (if any) to output/errors.json
+  const errorsPath = path.join(baseDir, 'output', 'errors.json');
+  fs.writeFileSync(errorsPath, JSON.stringify(errorRecords, null, 2), 'utf-8');
+
+  // Stage 4 Checkpoint Assertions
+  const allPricesAreNumbers = validBooks.every(b => typeof b.price_gbp === 'number' && !isNaN(b.price_gbp));
+  const allUrlsAreHttps = validBooks.every(b => b.product_url.startsWith('https://'));
+
+  console.log('=== Stage 4 Checkpoint ===');
+  console.log(`books.json count: ${validBooks.length}`);
+  console.log(`errors.json count: ${errorRecords.length}`);
+  console.log(`Assertion - Every price_gbp is a number: ${allPricesAreNumbers}`);
+  console.log(`Assertion - Every product_url starts with https://: ${allUrlsAreHttps}`);
+
+  console.log('\n[+] Stage 4 complete. Clean records saved to output/books.json');
+  return { validBooks, errorRecords };
 }
 
 async function main() {
-  console.log('=== Ethical Web Scraper Pipeline: Stages 1-3 ===\n');
+  console.log('=== Ethical Web Scraper Pipeline: Stages 1-4 ===\n');
   const overallStart = performance.now();
   
   initializeEnvironment();
   await processPipeline();
 
   const totalSeconds = ((performance.now() - overallStart) / 1000).toFixed(2);
-  console.log(`\n[+] Stage 3 execution finished in ${totalSeconds}s.`);
+  console.log(`\n[+] Stage 4 execution finished in ${totalSeconds}s.`);
 }
 
 // Trigger Execution
