@@ -3,3 +3,4 @@ report.db
 node_modules/
 !*.json
 !*.html
+*.pdf
