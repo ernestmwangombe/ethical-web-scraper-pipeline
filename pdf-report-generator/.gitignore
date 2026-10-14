@@ -1,0 +1,5 @@
+reports/
+report.db
+node_modules/
+!*.json
+!*.html
