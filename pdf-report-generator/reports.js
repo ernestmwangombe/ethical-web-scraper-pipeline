@@ -89,3 +89,60 @@ export function getReport(id) {
     db.close();
   }
 }
+
+
+// Find the latest finished report created today (UTC), or return null
+function findTodaysReport() {
+  // Open the database for this lookup
+  const db = openDb();
+  // Use try/finally so the connection always closes
+  try {
+    // Get today's date as YYYY-MM-DD in UTC, matching how created_at is stored
+    const today = new Date().toISOString().slice(0, 10);
+    // Look for the newest row from today whose PDF has finished (path is not empty)
+    const row = db
+      .prepare(
+        "SELECT id FROM reports WHERE path != '' AND substr(created_at, 1, 10) = ? ORDER BY id DESC LIMIT 1"
+      )
+      .get(today);
+    // Return the id and link if found, otherwise null
+    return row ? { id: row.id, file: `/reports/${row.id}/file` } : null;
+  } finally {
+    // Close the database connection
+    db.close();
+  }
+}
+
+// Remember a generation that is currently running so duplicates can share it
+let inFlight = null;
+
+// Return today's report if it exists, otherwise create one (force skips the check)
+export async function getOrCreateReport(force = false) {
+  // When force is true, always make a brand new report
+  if (force) {
+    // Create the report and mark it as newly created
+    return { ...(await createReport()), created: true };
+  }
+  // Check whether a finished report already exists for today
+  const existing = findTodaysReport();
+  // If one exists, return it without generating anything
+  if (existing) {
+    // Mark it as NOT newly created so the endpoint can answer 200
+    return { ...existing, created: false };
+  }
+  // If a generation is already running, wait for it instead of starting another
+  if (inFlight) {
+    // Share the running generation's result and mark it as not newly created
+    return { ...(await inFlight), created: false };
+  }
+  // Otherwise start a new generation and remember it as the one in flight
+  inFlight = createReport();
+  // Use try/finally so the in-flight marker is always cleared
+  try {
+    // Wait for the report to finish and mark it as newly created
+    return { ...(await inFlight), created: true };
+  } finally {
+    // Clear the marker so the next request can start fresh
+    inFlight = null;
+  }
+}

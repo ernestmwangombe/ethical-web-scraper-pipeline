@@ -4,8 +4,8 @@ import express from 'express';
 import { join } from 'node:path';
 // Import existsSync to check the PDF is still on disk
 import { existsSync } from 'node:fs';
-// Import the report functions from the new module
-import { createReport, getReport } from './reports.js';
+// Import the report functions (getOrCreateReport replaces createReport)
+import { getOrCreateReport, getReport } from './reports.js';
 
 // Create the Express application instance
 const app = express();
@@ -13,20 +13,25 @@ const app = express();
 // Choose the port from the environment, falling back to 3000
 const PORT = process.env.PORT || 3000;
 
+// Let Express read JSON request bodies such as {"force": true}
+app.use(express.json());
+
 // Health-check route from Stage 0
 app.get('/health', (req, res) => {
   // Reply with HTTP 200 and the JSON body the assignment asks for
   res.status(200).json({ status: 'ok' });
 });
 
-// Generate a report: runs the whole pipeline inside the request
+// Generate a report, or return today's existing one
 app.post('/reports', async (req, res) => {
   // Catch any failure so the server answers instead of crashing
   try {
-    // Query, render, store, and get back the id and link (takes a few seconds)
-    const report = await createReport();
-    // Reply 201 Created with only the id and link, never the PDF bytes
-    res.status(201).json(report);
+    // Read the optional force flag; it only counts when it is exactly true
+    const force = req.body?.force === true;
+    // Get today's report, creating one only if needed (or forced)
+    const { created, id, file } = await getOrCreateReport(force);
+    // Reply 201 for a newly created report, or 200 for an existing one
+    res.status(created ? 201 : 200).json({ id, file });
   } catch (err) {
     // Log the real error on the server for debugging
     console.error('POST /reports failed:', err);
