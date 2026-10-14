@@ -43,3 +43,20 @@ export function getReportData() {
     db.close();
   }
 }
+
+
+// Export a second function that returns every book, for the long table
+export function getAllBooks() {
+  // Open the database connection for this call
+  const db = new DatabaseSync(DB_PATH);
+  // Use try/finally so the connection always closes
+  try {
+    // Return all 60 books in id order as an array of row objects
+    return db
+      .prepare('SELECT id, title, price, rating, url FROM books ORDER BY id ASC')
+      .all();
+  } finally {
+    // Close the database connection whether the query worked or failed
+    db.close();
+  }
+}
