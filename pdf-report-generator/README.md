@@ -13,6 +13,7 @@ Option B, the bookstore: the 60 validated books scraped from books.toscrape.com 
 Requires Node.js 22+ (uses the built-in `node:sqlite`).
 
 ```bash
+   git clone https://github.com/ernestmwangombe/ethical-web-scraper-pipeline.git
 cd pdf-report-generator
 npm install
 npx playwright install chromium
@@ -83,11 +84,11 @@ Both carry id 1, and `reports/` went from 0 to exactly 1 PDF. A later POST retur
 
 ## Stage 4: when would I move this work out of the request?
 
-One report takes about 2.6 seconds with 60 books, which is fine for one user, but I would move it out of the request once it regularly takes more than a few seconds (thousands of rows or many users at once) or nears a typical 30-second timeout, by returning 202 straight away and letting a background job build the PDF.
+Generating a report with 60 books typically takes about 2.6 seconds, which is acceptable for single-user scenarios. If report generation time increases beyond a few seconds (such as with thousands of rows or multiple concurrent users) or approaches the standard 30-second timeout, the process should be handled asynchronously: this would immediately return a 202 Accepted status, and a background job would generate the PDF.
 
 ## Stage 5: what the duplicate check does
 
-The check protects against a double-clicked button creating two reports for one request: the second request gets today’s existing report (200, same id and link) instead of a new file, even if the first is still rendering. Without a check like this, a paid action such as billing a customer for a generated report would run twice, costing the customer money and the company their trust.
+This safeguard ensures that if a user double-clicks the button, only one report is generated per day (UTC), unless force is used. Any subsequent request on the same day returns the existing report (200, using the same ID and link), even if the initial report is still processing. Without this protection, duplicate paid actions (like customer billing) could occur, resulting in unnecessary charges and eroding user trust.
 
 ## Screenshot: page 1 of a generated PDF
 
