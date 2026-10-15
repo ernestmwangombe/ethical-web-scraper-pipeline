@@ -88,12 +88,9 @@ Generating a report with 60 books typically takes about 2.6 seconds, which is ac
 
 ## Stage 5: what the duplicate check does
 
-HEAD
+
 This safeguard ensures that if a user double-clicks the button, only one report is generated per day (UTC), unless force is used. Any subsequent request on the same day returns the existing report (200, using the same ID and link), even if the initial report is still processing. Without this protection, duplicate paid actions (like customer billing) could occur, resulting in unnecessary charges and eroding user trust.
 
-
-This safeguard ensures that if a user double-clicks the button, only one report is generated per request. Any subsequent request on the same day returns the existing report (200, using the same ID and link), even if the initial report is still processing. Without this protection, duplicate paid actions (like customer billing) could occur, resulting in unnecessary charges and eroding user trust.
-02731b29013edb427ec903cc69b55de8c6c10146
 ## Screenshot: page 1 of a generated PDF
 
 ![Page 1 of the generated report](docs/page1.png)
